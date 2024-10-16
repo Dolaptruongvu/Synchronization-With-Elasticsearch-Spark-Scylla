@@ -34,8 +34,11 @@ libraryDependencies ++= Seq(
   "org.apache.spark" %% "spark-sql" % "3.1.2",
   "com.datastax.spark" %% "spark-cassandra-connector" % "3.1.0",
   "joda-time" % "joda-time" % "2.10.10",
-  "org.elasticsearch" %% "elasticsearch-spark-30" % "8.6.2"
+  "org.elasticsearch" %% "elasticsearch-spark-30" % "8.6.2",
 )
+
+libraryDependencies += "com.github.jnr" % "jnr-posix" % "3.1.7"
+
 
 resolvers += "Spark Packages Repo" at "https://repos.spark-packages.org/"
 dependencyOverrides += "org.scala-lang.modules" %% "scala-parser-combinators" % "1.1.2"
