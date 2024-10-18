@@ -5,7 +5,6 @@ import org.apache.log4j.{Level, Logger}
 import scala.sys.process._
 import java.sql.Timestamp
 import java.util.UUID
-import java.net.{HttpURLConnection, URL}
 import org.elasticsearch.spark.sql._
 import java.io._
 import java.nio.file.{Files, Paths}
@@ -16,7 +15,7 @@ object Main {
   def main(args: Array[String]): Unit = {
     Logger.getLogger("org").setLevel(Level.ERROR)
     Logger.getLogger("akka").setLevel(Level.ERROR)
-    var metricCount = 0 // Variable metricCount
+    var metricCount: Long = 0 // Metric counter, now Long
 
     // Create SparkSession with Scylla configuration
     val spark = SparkSession.builder()
@@ -37,7 +36,7 @@ object Main {
     )
     val result = command.!!
 
-    // Check the raw result string
+    // Check raw result string
     println(s"Raw result from DESCRIBE TABLES: \n$result")
 
     // Split the result string into the list of main tables
@@ -47,8 +46,7 @@ object Main {
       .toList
 
     // Print the list of main tables for checking
-    println(s"List of main tables after splitting: "
-      + s"${tableNames.mkString(", ")}")
+    println(s"List of main tables after splitting: ${tableNames.mkString(", ")}")
 
     // Loop through each main table and synchronize CDC data
     tableNames.foreach { tableName =>
@@ -72,38 +70,26 @@ object Main {
 
       } catch {
         case e: Exception =>
-          println(s"Failed to read data from CDC table: "
-            + s"$cdcTableName. Error: ${e.getMessage}")
+          println(s"Failed to read data from CDC table: $cdcTableName. Error: ${e.getMessage}")
           e.printStackTrace()
           // Continue with the next table
           return
       }
 
       // Continue processing if no error
-      println("cdcDf with cdc$time")
+      println("cdcDF with cdc$time")
       cdcDF.select("cdc$time").show()
 
       if (cdcDF.columns.contains("profile_uuid")) {
-        println("profile_uuid found, proceeding with syncing.")
-
-        // Read data from the entity table
-        val entityDF = spark.read
-          .format("org.apache.spark.sql.cassandra")
-          .options(Map(
-            "table" -> tableName,
-            "keyspace" -> "social_data"
-          ))
-          .load()
+        println("Found 'profile_uuid', proceeding with sync.")
 
         // Call the sync function and update metricCount
         metricCount += syncTableToElasticsearch(
-          spark, cdcDF, entityDF,
-          tableName, "social_data"
+          spark, cdcDF, tableName, "social_data"
         )
 
       } else {
-        println(s"Column 'profile_uuid' not found in "
-          + s"$cdcTableName. Skipping this CDC table.")
+        println(s"Column 'profile_uuid' not found in $cdcTableName. Skipping this CDC table.")
       }
     }
 
@@ -120,189 +106,194 @@ object Main {
       "es.mapping.id" -> "id_count"
     ))
 
-    println(s"Total metrics saved with id_count: $idCount, count: "
-      + s"$metricCount, lastupdated: $lastUpdated")
+    println(s"Total metrics saved with id_count: $idCount, count: $metricCount, lastupdated: $lastUpdated")
 
     // Stop SparkSession
     spark.stop()
+  }
+
+  // Function to convert UUID to Timestamp
+  def uuidToTimestamp(uuidStr: String): Timestamp = {
+    if (uuidStr != null) {
+      val uuid = UUID.fromString(uuidStr)
+      // Convert timestamp from 100-ns intervals since 1582-10-15
+      val timestamp = (uuid.timestamp() - 0x01b21dd213814000L) / 10000L
+      new Timestamp(timestamp)
+    } else null
+  }
+
+  // UDF to extract values from Map
+  val extractValuesUDF = udf((map: Map[String, String]) => {
+    if (map != null && map.nonEmpty) map.values.toArray
+    else Array.empty[String]
+  })
+
+  // Function to remove null and empty fields from DataFrame
+  def filterValidFields(df: DataFrame): DataFrame = {
+    df.schema.fields.foldLeft(df) { (tempDf, field) =>
+      field.dataType match {
+        case StringType =>
+          tempDf.withColumn(field.name, when(col(field.name).isNotNull && !(col(field.name) === ""), col(field.name)).otherwise(null))
+        case ArrayType(_, _) =>
+          tempDf.withColumn(field.name, when(size(col(field.name)) =!= 0, col(field.name)).otherwise(null))
+        case _ =>
+          tempDf
+      }
+    }
   }
 
   // Function to sync DataFrame from Scylla/Cassandra to Elasticsearch
   def syncTableToElasticsearch(
       spark: SparkSession,
       cdcDfInput: DataFrame,
-      entityDf: DataFrame,
       indexName: String,
       keyspace: String
-  ): Int = {
+  ): Long = {
     import spark.implicits._
-    import java.io._
-    import java.nio.file.{Files, Paths}
-    import scala.io.Source
     import org.apache.spark.sql.functions._
+    import org.apache.spark.sql.types._
 
     // Path to the file that stores last_processed_time
     val filePath = s"last_processed_time_$indexName.txt"
 
-    // Function to read last_processed_time from file
-    def readLastProcessedTime(filePath: String): Option[String] = {
-      if (Files.exists(Paths.get(filePath))) {
-        val lines = Source.fromFile(filePath).getLines()
-        if (lines.hasNext) Some(lines.next())
-        else None
-      } else None
-    }
+    // Read last_processed_time from file
+    val lastProcessedTime = readLastProcessedTime(filePath)
 
-    // Function to write last_processed_time to file
-    def writeLastProcessedTime(
-        filePath: String,
-        lastProcessedTime: String
-    ): Unit = {
-      val file = new File(filePath)
-      val bw = new BufferedWriter(new FileWriter(file))
-      bw.write(lastProcessedTime)
-      bw.close()
-    }
-
-    // Function to convert UUID to Timestamp
-    def uuidToTimestamp(uuidStr: String): Timestamp = {
-      if (uuidStr != null) {
-        val uuid = UUID.fromString(uuidStr)
-        // Convert timestamp from 100-ns intervals since 1582-10-15
-        val timestamp = (uuid.timestamp() - 0x01b21dd213814000L) / 10000L
-        new Timestamp(timestamp)
-      } else null
-    }
+    println(s"Last processed time for table $indexName: $lastProcessedTime")
 
     // Register UDF
     val uuidToTimestampUDF = udf(uuidToTimestamp _)
 
+    // Add column cdc_timestamp using UDF
+    var cdcDf = cdcDfInput.withColumn("cdc_timestamp", uuidToTimestampUDF(col("cdc$time")))
+
+    // Filter cdcDf based on lastProcessedTime if available
+    if (lastProcessedTime.isDefined) {
+      val lastProcessedTimestamp = Timestamp.valueOf(lastProcessedTime.get)
+      cdcDf = cdcDf.filter(col("cdc_timestamp") > lastProcessedTimestamp)
+    }
+
+    // Print the DataFrame after adding column and filtering
+    println(s"CDC DataFrame input for table $indexName after filtering by last processed time: ")
+    cdcDf.show()
+
+    // Filter out columns that do not start with cdc$, except for cdc$operation and cdc_timestamp
+    val columnsToKeep = cdcDf.columns.filter(col => !col.startsWith("cdc$") || col == "cdc$operation" || col == "cdc_timestamp")
+
+    // Select the columns to keep in the DataFrame
+    var filteredCdcDf = cdcDf.select(columnsToKeep.head, columnsToKeep.tail: _*)
+
+    // Print the DataFrame after filtering columns
+    println("Dataframe after filtering columns")
+    filteredCdcDf.show()
+
+    // Apply UDF extractValuesUDF to columns of type Map[String, String]
+    filteredCdcDf.schema.fields.foreach { field =>
+      field.dataType match {
+        case MapType(StringType, StringType, _) =>
+          filteredCdcDf = filteredCdcDf.withColumn(field.name, extractValuesUDF(col(field.name)))
+        case _ => // Do nothing if not of type Map[String, String]
+      }
+    }
+
+    // Get the latest timestamp from cdc_timestamp column after filtering
+    val latestTimestamp = cdcDf
+      .sort(desc("cdc_timestamp"))
+      .select("cdc_timestamp")
+      .as[Timestamp]
+      .take(1)
+      .headOption
+
+    latestTimestamp match {
+      case Some(ts) => println(s"Latest timestamp: $ts")
+      case None => println("No timestamp found")
+    }
+
+    // Filter records with operation = 1 or 2
+    val upsertCdcDf = filteredCdcDf.filter(col("cdc$operation") === 1 || col("cdc$operation") === 2)
+
+    // Filter records with operation = 4
+    val deleteCdcDf = filteredCdcDf.filter(col("cdc$operation") === 4)
+
+    // Find profile_uuid in upsertCdcDf with the largest cdc_timestamp
+    val latestUpsertDf = upsertCdcDf
+      .groupBy("profile_uuid")
+      .agg(max("cdc_timestamp").as("max_timestamp_upsert"))
+
+    // Combine deleteCdcDf with latestUpsertDf and keep records in deleteCdcDf with cdc_timestamp greater than max_timestamp_upsert
+    val validDeleteDf = deleteCdcDf
+      .join(latestUpsertDf, Seq("profile_uuid"), "left_outer")
+      .filter($"cdc_timestamp" > $"max_timestamp_upsert" || $"max_timestamp_upsert".isNull)
+
+    // Remove the 'cdc$operation' and 'cdc_timestamp' columns from upsertCdcDf
+    val upsertData = upsertCdcDf.drop("cdc$operation", "cdc_timestamp")
+
+    // Keep only non-null fields
+    val upsertDataWithValidValues = filterValidFields(upsertData)
+
+    println("Final upsertData")
+    upsertDataWithValidValues.show()
+
+    // Keep only 'profile_uuid' column for deleteCdcDf
+    val deleteData = validDeleteDf.select("profile_uuid")
+    println("Final deleteData")
+    deleteData.show()
+
+    var affectedRowCount: Long = 0 // Initialize affectedRowCount as Long
+
     try {
-      // Read last_processed_time from file
-      val lastProcessedTime = readLastProcessedTime(filePath)
-
-      println(s"Last processed time for table $indexName: "
-        + s"$lastProcessedTime")
-
-      // Declare variable cdcDf for modification
-      var cdcDf = cdcDfInput
-
-      // Add column cdc_timestamp using UDF
-      cdcDf = cdcDf.withColumn("cdc_timestamp",
-        uuidToTimestampUDF(col("cdc$time")))
-
-      // Filter cdcDf based on lastProcessedTime if available
-      if (lastProcessedTime.isDefined) {
-        val lastProcessedTimestamp = Timestamp.valueOf(
-          lastProcessedTime.get)
-        cdcDf = cdcDf.filter(
-          col("cdc_timestamp") > lastProcessedTimestamp)
-      }
-
-      // Read CDC DataFrame
-      println("CDC DataFrame after filtering: ")
-      cdcDf.orderBy(desc("cdc_timestamp")).show()
-
-      // Extract new and deleted data based on cdc$operation
-      val sortCdc = cdcDf.orderBy(desc("cdc_timestamp"))
-      val distinctCdc = sortCdc.dropDuplicates("profile_uuid")
-
-      // Filter for upsert operations (operation 1 or 2)
-      val upsertCdc = distinctCdc
-        .filter("`cdc$operation` >= 1 AND `cdc$operation` <= 2")
-        .select("cdc$operation", "profile_uuid")
-        .dropDuplicates("profile_uuid")
-
-      // Filter for delete operations (operation 4)
-      val deleteCdc = distinctCdc
-        .filter("`cdc$operation`=4")
-        .select("cdc$operation", "profile_uuid")
-        .dropDuplicates("profile_uuid")
-
-      println("Entity DataFrame: ")
-      entityDf.show()
-
-      println("Upsert Cdc DataFrame: ")
-      upsertCdc.show()
-
-      println("Delete Cdc DataFrame: ")
-      deleteCdc.show()
-
-      // Save upsert data to Elasticsearch
-      upsertCdc.createOrReplaceTempView("upsert_entities")
-      entityDf.createOrReplaceTempView("entities")
-      val filteredEntityDf = spark.sql(
-        s"""
-        SELECT * FROM entities
-        WHERE profile_uuid IN (
-          SELECT profile_uuid FROM upsert_entities
-        )
-        """)
-
-      // Display resulting DataFrame
-      println(s"Filtered Entities based on upsertCdc profile_uuid:")
-      filteredEntityDf.show()
-
-      // Save data to Elasticsearch with upsert mechanism
-      filteredEntityDf.saveToEs(indexName, Map(
-        "es.write.operation" -> "upsert", // Use upsert
-        "es.mapping.id" -> "profile_uuid" // Use profile_uuid as id
+      // Perform upsert to Elasticsearch for upsertData
+      affectedRowCount += upsertDataWithValidValues.count() // Count the number of rows in upsertData
+      upsertDataWithValidValues.saveToEs(indexName, Map(
+        "es.write.operation" -> "upsert",
+        "es.mapping.id" -> "profile_uuid"   // Use profile_uuid as ID to upsert
       ))
+      println("Upsert to Elasticsearch completed successfully.")
 
-      // Handle delete data
-      val deleteCdcRDD = deleteCdc.select("profile_uuid").rdd
-      deleteCdcRDD.foreachPartition { partition =>
-        partition.foreach { row =>
-          val profile_uuid = row.getAs[String]("profile_uuid")
-          val urlString = s"http://localhost:9200/$indexName/" +
-            s"_doc/$profile_uuid"
-          sendDeleteRequest(urlString)
-        }
+      // Perform delete in Elasticsearch for deleteData
+      affectedRowCount += deleteData.count() // Count the number of rows in deleteData
+      deleteData.saveToEs(indexName, Map(
+        "es.write.operation" -> "delete",    // Delete data based on profile_uuid
+        "es.mapping.id" -> "profile_uuid"    // Use profile_uuid as ID to delete
+      ))
+      println("Delete from Elasticsearch completed successfully.")
+
+      // Write 'latestTimestamp' to file after Elasticsearch operations are successful
+      latestTimestamp match {
+        case Some(ts) =>
+          writeLastProcessedTime(filePath, ts.toString)
+          println(s"Wrote the last processed time to file: $ts")
+        case None =>
+          println("No timestamp to write to file")
       }
-
-      def sendDeleteRequest(urlString: String): Unit = {
-        val urlObj = new URL(urlString)
-        val connection = urlObj.openConnection()
-          .asInstanceOf[HttpURLConnection]
-        connection.setRequestMethod("DELETE")
-        val responseCode = connection.getResponseCode
-        if (responseCode == 200 || responseCode == 204) {
-          println(s"Successfully deleted document with URL: $urlString")
-        } else {
-          println(s"Failed to delete document with URL: $urlString, "
-            + s"Response Code: $responseCode")
-        }
-        connection.disconnect()
-      }
-
-      // Calculate updatedMetricCount
-      val updatedMetricCount = filteredEntityDf.count.toInt
-        + deleteCdc.count.toInt
-
-      // Update last_processed_time into the file
-      val latestCdcTimeRow = sortCdc.select("cdc_timestamp")
-        .as[Timestamp].take(1).headOption
-
-      if (latestCdcTimeRow.isDefined) {
-        val latestCdcTime = latestCdcTimeRow.get.toString
-        writeLastProcessedTime(filePath, latestCdcTime)
-        println(s"Updated last processed time for table $indexName: "
-          + s"$latestCdcTime")
-      } else {
-        println(s"No data processed for table $indexName, "
-          + s"last processed time remains unchanged.")
-      }
-
-      // Return updatedMetricCount
-      updatedMetricCount
 
     } catch {
       case e: Exception =>
-        println(s"An error occurred while syncing table $indexName: "
-          + s"${e.getMessage}")
-        e.printStackTrace()
-        // Return 0 if an error occurs
-        0
+        println(s"An error occurred while interacting with Elasticsearch: ${e.getMessage}")
+        e.printStackTrace() // Log detailed error information if needed
     }
+
+    // Return the number of affected rows (upsert + delete)
+    affectedRowCount
+  }
+
+  // Function to read last_processed_time from file
+  def readLastProcessedTime(filePath: String): Option[String] = {
+    if (Files.exists(Paths.get(filePath))) {
+      val lines = Source.fromFile(filePath).getLines()
+      if (lines.hasNext) Some(lines.next())
+      else None
+    } else None
+  }
+
+  // Function to write last_processed_time to file
+  def writeLastProcessedTime(
+      filePath: String,
+      lastProcessedTime: String
+  ): Unit = {
+    val file = new File(filePath)
+    val bw = new BufferedWriter(new FileWriter(file))
+    bw.write(lastProcessedTime)
+    bw.close()
   }
 }
